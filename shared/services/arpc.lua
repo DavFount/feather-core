@@ -58,8 +58,8 @@ local function GetResponseFunction(id, requestSource, expectedSession)
         if responded then return end
         responded = true
         if expectedSession and IsOnServer() then
-            if not CharacterAPI or not CharacterAPI.IsSessionCurrent
-                or not CharacterAPI.IsSessionCurrent(requestSource, expectedSession.sessionId, expectedSession.characterId) then
+            if not CoreSessions or not CoreSessions.IsCurrent
+                or not CoreSessions.IsCurrent(requestSource, expectedSession.sessionId, expectedSession.characterId) then
                 TriggerRemoteEvent("Feather:Response", requestSource, id, nil, {
                     code = 'character_session_expired',
                     message = 'Character session is no longer current.'
@@ -117,6 +117,35 @@ end
 
 local function RpcError(code, message)
     return { code = code, message = message }
+end
+
+local function ValidatePlainData(value, limits, depth, seen, count)
+    local valueType = type(value)
+    if valueType == 'nil' or valueType == 'boolean' or valueType == 'string' then
+        return true, count + 1
+    end
+    if valueType == 'number' then
+        return value == value and value ~= math.huge and value ~= -math.huge, count + 1
+    end
+    if valueType ~= 'table' then
+        return false, count
+    end
+    if depth >= limits.maxDepth or seen[value] then
+        return false, count
+    end
+
+    seen[value] = true
+    count = count + 1
+    if count > limits.maxNodes then return false, count end
+    for key, child in pairs(value) do
+        local keyType = type(key)
+        if keyType ~= 'string' and keyType ~= 'number' then return false, count end
+        local valid
+        valid, count = ValidatePlainData(child, limits, depth + 1, seen, count)
+        if not valid or count > limits.maxNodes then return false, count end
+    end
+    seen[value] = nil
+    return true, count
 end
 
 if IsOnServer() then
@@ -190,6 +219,15 @@ AddEventHandler("Feather:Call", function(id, name, params)
 
     local registered = registeredProcedures[name]
     local policy = registered.policy
+    if registered.contract then
+        local directionAllowed = (IsOnServer() and registered.direction == 'client_to_server')
+            or (not IsOnServer() and registered.direction == 'server_to_client')
+        if not directionAllowed then
+            if id then TriggerRemoteEvent("Feather:Response", requestSource, id,
+                CoreResults.Err('forbidden', 'RPC route direction does not allow this call.')) end
+            return
+        end
+    end
     if IsProcedureRateLimited(requestSource, name, policy) then
         if id then TriggerRemoteEvent("Feather:Response", requestSource, id, nil, RpcError('rate_limited', 'RPC procedure rate limit exceeded.')) end
         return
@@ -199,19 +237,42 @@ AddEventHandler("Feather:Call", function(id, name, params)
     if IsOnServer() then
         requestContext = {
             source = requestSource,
-            correlationId = ('rpc:%s:%s:%s'):format(tostring(requestSource), tostring(GetGameTimer()), tostring(id or 'notify'))
+            correlationId = ('rpc:%s:%s:%s'):format(tostring(requestSource), tostring(GetGameTimer()), tostring(id or 'notify')),
+            route = name,
+            owner = registered.owner,
+            contract = registered.contract
         }
 
+        local account = CoreAccounts and CoreAccounts.GetContext and CoreAccounts.GetContext(requestSource) or nil
+        if account and account.ok then requestContext.accountId = account.value.accountId end
+
         if policy.requireCharacter then
-            local session = CharacterAPI and CharacterAPI.ResolveSession and CharacterAPI.ResolveSession(requestSource) or nil
+            local sessionResult = CoreSessions and CoreSessions.Get and CoreSessions.Get(requestSource) or nil
+            local session = sessionResult and sessionResult.ok and sessionResult.value or nil
             if not session then
                 if id then TriggerRemoteEvent("Feather:Response", requestSource, id, nil,
                     RpcError('character_required', 'A current character session is required.')) end
                 return
             end
+            -- Temporary construction detail: legacy consumers may still use
+            -- the cached character record. Contract routes receive identity
+            -- from CoreSessions and do not require that legacy cache to exist.
+            local legacyCharacter = CacheAPI and CacheAPI.GetCacheBySrc
+                and CacheAPI.GetCacheBySrc('character', requestSource) or nil
             requestContext.characterId = session.characterId
             requestContext.sessionId = session.sessionId
-            requestContext.character = session.character
+            requestContext.accountId = session.accountId
+            requestContext.generation = session.generation
+            requestContext.character = legacyCharacter
+        end
+    end
+
+    if registered.contract then
+        local plain = ValidatePlainData(params, policy, 0, {}, 0)
+        if not plain then
+            if id then TriggerRemoteEvent("Feather:Response", requestSource, id,
+                CoreResults.Err('invalid_input', 'RPC payload must contain bounded plain data.')) end
+            return
         end
     end
 
@@ -272,15 +333,112 @@ function RPCAPI.Register(name, callback, options)
         windowMs = math.max(100, tonumber(options.windowMs) or tonumber(defaults.windowMs) or 1000),
         maxCalls = options.maxCalls and math.max(1, tonumber(options.maxCalls) or 1) or nil,
         maxPayloadBytes = math.max(64, tonumber(options.maxPayloadBytes) or tonumber(defaults.maxPayloadBytes) or 65536),
-        requireCharacter = options.requireCharacter == true
+        requireCharacter = options.requireCharacter == true,
+        maxDepth = math.max(1, math.min(32, tonumber(options.maxDepth) or 12)),
+        maxNodes = math.max(1, math.min(10000, tonumber(options.maxNodes) or 2048))
     }
     if Config.DevMode then
         print("Registered RPC: ", name)
     end
 
-    registeredProcedures[name] = { callback = callback, policy = policy, owner = owner }
+    registeredProcedures[name] = {
+        callback = callback,
+        policy = policy,
+        owner = owner,
+        contract = tonumber(options.contract),
+        direction = options.direction
+    }
 
     return true
+end
+
+function RPCAPI.RegisterContract(name, callback, options)
+    options = type(options) == 'table' and options or {}
+    if type(name) ~= 'string' or not name:match('%.v%d+$') then
+        return CoreResults.Err('invalid_input', 'Contract RPC route names must end with a version suffix such as .v1.')
+    end
+    if not IsCallable(callback) then
+        return CoreResults.Err('invalid_input', 'Contract RPC routes require a callable handler.')
+    end
+    if registeredProcedures[name] then
+        return CoreResults.Err('conflict', 'That RPC route is already registered.', { route = name })
+    end
+
+    local contract = tonumber(options.contract) or tonumber(name:match('%.v(%d+)$'))
+    local direction = options.direction or (IsOnServer() and 'client_to_server' or 'server_to_client')
+    if contract < 1 or (direction ~= 'client_to_server' and direction ~= 'server_to_client' and direction ~= 'server_local') then
+        return CoreResults.Err('invalid_input', 'Contract RPC registration metadata is invalid.')
+    end
+
+    local payloadValidator = options.validatePayload
+    local responseValidator = options.validateResponse
+    if payloadValidator ~= nil and not IsCallable(payloadValidator) then
+        return CoreResults.Err('invalid_input', 'validatePayload must be callable when provided.')
+    end
+    if responseValidator ~= nil and not IsCallable(responseValidator) then
+        return CoreResults.Err('invalid_input', 'validateResponse must be callable when provided.')
+    end
+
+    local wrapped = function(params, respond, source, context)
+        if payloadValidator then
+            local valid, reason = payloadValidator(params, context)
+            if valid ~= true then
+                local failure = CoreResults.Is(reason) and reason
+                    or CoreResults.Err('invalid_input', type(reason) == 'string' and reason or 'RPC payload validation failed.')
+                return respond(failure)
+            end
+        end
+
+        local result = callback(params, source, context)
+        if not CoreResults.Is(result) then
+            return respond(CoreResults.Err('internal_error', 'RPC handler returned an invalid result envelope.'))
+        end
+
+        if responseValidator then
+            local valid, reason = responseValidator(result, context)
+            if valid ~= true then
+                result = CoreResults.Is(reason) and reason
+                    or CoreResults.Err('internal_error', 'RPC response validation failed.')
+            end
+        end
+        return respond(result)
+    end
+
+    local registrationOptions = {}
+    for key, value in pairs(options) do registrationOptions[key] = value end
+    registrationOptions.contract = contract
+    registrationOptions.direction = direction
+    registrationOptions.validatePayload = nil
+    registrationOptions.validateResponse = nil
+
+    if not RPCAPI.Register(name, wrapped, registrationOptions) then
+        return CoreResults.Err('registration_failed', 'RPC route registration failed.', { route = name })
+    end
+    local registered = registeredProcedures[name]
+    return CoreResults.Ok({
+        route = name,
+        owner = registered.owner,
+        contract = contract,
+        direction = direction
+    })
+end
+
+function RPCAPI.GetRoutes()
+    local routes = {}
+    for name, registered in pairs(registeredProcedures) do
+        routes[#routes + 1] = {
+            route = name,
+            owner = registered.owner,
+            contract = registered.contract,
+            direction = registered.direction,
+            requireCharacter = registered.policy.requireCharacter,
+            maxPayloadBytes = registered.policy.maxPayloadBytes,
+            maxDepth = registered.policy.maxDepth,
+            maxNodes = registered.policy.maxNodes
+        }
+    end
+    table.sort(routes, function(left, right) return left.route < right.route end)
+    return routes
 end
 
 -- Send a single RPC but emit a callback
@@ -316,3 +474,12 @@ function RPCAPI.CallAsync(name, params, source, timeoutMs)
     -- Unpack the "awaited" promise. (Waits for the promise to be "done"/resolved)
     return table.unpack(Citizen.Await(p))
 end
+
+-- Named exports are the Contract 1 access boundary. The legacy initiate()
+-- table remains available only while first-party consumers are migrated.
+exports('RegisterRPC', RPCAPI.Register)
+exports('RegisterContractRPC', RPCAPI.RegisterContract)
+exports('GetRPCRoutes', function() return CoreResults.Ok(RPCAPI.GetRoutes()) end)
+exports('NotifyRPC', RPCAPI.Notify)
+exports('CallRPC', RPCAPI.Call)
+exports('CallRPCAsync', RPCAPI.CallAsync)

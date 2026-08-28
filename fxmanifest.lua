@@ -6,7 +6,7 @@ lua54 "yes"
 description 'The Core service for the Feather Framework'
 author 'Feather @Bytesizd'
 name 'feather-core'
-version '0.1.8'
+version '0.2.0'
 
 github_version_check 'true'
 github_version_type 'release'
@@ -25,6 +25,7 @@ shared_scripts {
 
 server_scripts {
     "@oxmysql/lib/MySQL.lua",
+    "/server/migrations/*.lua",
     "/server/helpers/*.lua",
     "/server/controllers/*.lua",
     "/server/services/*.lua",
